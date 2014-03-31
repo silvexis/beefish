@@ -2,10 +2,11 @@
 import getpass
 import optparse
 import os
-import struct
 import sys
 import unittest
 from random import randrange
+from hashlib import md5
+from os import urandom
 
 PY3 = sys.version_info[0] == 3
 if PY3:
@@ -26,8 +27,11 @@ except ImportError:
         from StringIO import StringIO
 
 from Crypto.Cipher import Blowfish
+from Crypto.Cipher import AES
 from Crypto import Random
 
+__BLOWFISH__ = 1
+__AES__ = 2
 
 def _gen_padding(file_size, block_size):
     pad_bytes = block_size - (file_size % block_size)
@@ -36,22 +40,65 @@ def _gen_padding(file_size, block_size):
     bflag -= bflag % block_size - pad_bytes
     return padding + chr(bflag)
 
+
 def _read_padding(buffer, block_size):
     return (ord(buffer[-1]) % block_size) or block_size
+
 
 def generate_iv(block_size):
     return Random.get_random_bytes(block_size)
 
-def get_cipher(key, iv):
+
+def derive_key_and_iv(password, salt, key_length, iv_length):
+    """
+
+    :param password:
+    :param salt:
+    :param key_length:
+    :param iv_length:
+    :return: (key, iv)
+    """
+    d = d_i = b''
+    while len(d) < key_length + iv_length:
+            d_i = md5(d_i + str.encode(password) + salt).digest()
+            d += d_i
+    return d[:key_length], d[key_length:key_length + iv_length]
+
+
+def get_blowfish_cipher(key, iv):
     return Blowfish.new(key, Blowfish.MODE_CBC, iv)
 
-def encrypt(in_buf, out_buf, key, chunk_size=4096):
-    iv = generate_iv(Blowfish.block_size)
-    cipher = get_cipher(key, iv)
+
+def get_aes_cipher(key, iv):
+    return AES.new(key, AES.MODE_CBC, iv)
+
+
+def encrypt(in_buf, out_buf, password, chunk_size=4096, cipher_type=__BLOWFISH__, salt_header=''):
+    """
+
+    :param in_buf:
+    :param out_buf:
+    :param password:
+    :param chunk_size:
+    :param cipher_type:
+    :param salt_header:
+    :raise AttributeError:
+    """
+
+    if cipher_type == __BLOWFISH__:
+        salt = urandom(Blowfish.block_size - len(salt_header))
+        key, iv = derive_key_and_iv(password=password, salt=salt, key_length=32, iv_length=Blowfish.block_size)
+        cipher = get_blowfish_cipher(password, iv)
+    elif cipher_type == __AES__:
+        salt = urandom(AES.block_size - len(salt_header))
+        key, iv = derive_key_and_iv(password=password, salt=salt, key_length=32, iv_length=AES.block_size)
+        cipher = get_aes_cipher(key, iv)
+    else:
+        raise AttributeError("Unknown cipher type")
+
+    out_buf.write(str.encode(salt_header) + salt)
     bytes_read = 0
     wrote_padding = False
-
-    out_buf.write(iv)
 
     while 1:
         buffer = in_buf.read(chunk_size)
@@ -67,10 +114,31 @@ def encrypt(in_buf, out_buf, key, chunk_size=4096):
                 out_buf.write(cipher.encrypt(_gen_padding(bytes_read, cipher.block_size)))
             break
 
-def decrypt(in_buf, out_buf, key, chunk_size=4096):
-    iv = in_buf.read(Blowfish.block_size)
 
-    cipher = get_cipher(key, iv)
+def decrypt(in_buf, out_buf, password, chunk_size=4096, salt_header='', cipher_type=__BLOWFISH__):
+
+    """
+
+    :param in_buf:
+    :param out_buf:
+    :param password:
+    :param chunk_size:
+    :param salt_header:
+    :param cipher_type:
+    :raise AttributeError:
+    """
+
+    if cipher_type == __BLOWFISH__:
+        salt = in_buf.read(Blowfish.block_size)[len(salt_header):]
+        key, iv = derive_key_and_iv(password=password, salt=salt, key_length=32, iv_length=Blowfish.block_size)
+        cipher = get_blowfish_cipher(password, iv)
+    elif cipher_type == __AES__:
+        salt = in_buf.read(AES.block_size)[len(salt_header):]
+        key, iv = derive_key_and_iv(password=password, salt=salt, key_length=32, iv_length=AES.block_size)
+        cipher = get_aes_cipher(key, iv)
+    else:
+        raise AttributeError("Unknown cipher type")
+
     decrypted = ''
 
     while 1:
@@ -86,15 +154,18 @@ def decrypt(in_buf, out_buf, key, chunk_size=4096):
         out_buf.seek(-padding, 2)
         out_buf.truncate()
 
-def encrypt_file(in_file, out_file, key, chunk_size=4096):
-    with open(in_file, 'rb') as in_fh:
-        with open(out_file, 'wb') as out_fh:
-            encrypt(in_fh, out_fh, key, chunk_size)
 
-def decrypt_file(in_file, out_file, key, chunk_size=4096):
+def encrypt_file(in_file, out_file, key, chunk_size=4096, cipher_type=__BLOWFISH__):
     with open(in_file, 'rb') as in_fh:
         with open(out_file, 'wb') as out_fh:
-            decrypt(in_fh, out_fh, key, chunk_size)
+            encrypt(in_fh, out_fh, key, chunk_size, cipher_type=cipher_type)
+
+
+def decrypt_file(in_file, out_file, key, chunk_size=4096, cipher_type=__BLOWFISH__):
+    with open(in_file, 'rb') as in_fh:
+        with open(out_file, 'wb') as out_fh:
+            decrypt(in_fh, out_fh, key, chunk_size, cipher_type=cipher_type)
+
 
 class TestEncryptDecrypt(unittest.TestCase):
     def setUp(self):
@@ -121,13 +192,13 @@ class TestEncryptDecrypt(unittest.TestCase):
             fh.write(buf)
         return buf
 
-    def crypt_data(self, num_bytes, ch, in_key=None, out_key=None, chunk_size=4096):
+    def crypt_data(self, num_bytes, ch, in_key=None, out_key=None, chunk_size=4096, cipher_type=__BLOWFISH__):
         in_key = in_key or self.key
         out_key = out_key or self.key
 
         buf = self.write_bytes(num_bytes, ch)
-        encrypt_file(self.in_filename, self.out_filename, in_key, chunk_size)
-        decrypt_file(self.out_filename, self.dec_filename, out_key, chunk_size)
+        encrypt_file(self.in_filename, self.out_filename, in_key, chunk_size, cipher_type=cipher_type)
+        decrypt_file(self.out_filename, self.dec_filename, out_key, chunk_size, cipher_type=cipher_type)
 
         with open(self.dec_filename, 'rb') as fh:
             decrypted = fh.read()
@@ -145,8 +216,30 @@ class TestEncryptDecrypt(unittest.TestCase):
         encrypt_flow('\x01')
         encrypt_flow('\xff')
 
+    def test_encrypt_decrypt_blowfish(self):
+        def encrypt_flow(ch):
+            for i in range(17):
+                buf, decrypted = self.crypt_data(i, ch, cipher_type=__BLOWFISH__)
+                self.assertEqual(buf, decrypted)
+
+        encrypt_flow('a')
+        encrypt_flow('\x00')
+        encrypt_flow('\x01')
+        encrypt_flow('\xff')
+
+    def test_encrypt_decrypt_aes(self):
+        def encrypt_flow(ch):
+            for i in range(17):
+                buf, decrypted = self.crypt_data(i, ch, cipher_type=__AES__)
+                self.assertEqual(buf, decrypted)
+
+        encrypt_flow('a')
+        encrypt_flow('\x00')
+        encrypt_flow('\x01')
+        encrypt_flow('\xff')
+
     def test_key(self):
-        buf, decrypted = self.crypt_data(128, 'a', self.key, self.key+'x')
+        buf, decrypted = self.crypt_data(128, 'a', self.key, self.key + 'x')
         self.assertNotEqual(buf, decrypted)
 
     def test_chunk_sizes(self):
